@@ -1,0 +1,12 @@
+.git
+.github
+.pytest_cache
+__pycache__
+build
+dist
+docs
+examples/online_serving/*/gradio_demo.py
+tests
+*.pyc
+*.pyo
+*.pyd

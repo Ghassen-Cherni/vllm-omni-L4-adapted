@@ -16,3 +16,5 @@ aenum==3.1.16
 pyzmq>=25.0.0
 janus>=1.0.0
 pydub
+httpx>=0.28.0
+uvicorn>=0.35.0

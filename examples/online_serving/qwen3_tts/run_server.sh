@@ -62,9 +62,12 @@ case "$PROFILE" in
 esac
 
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+HOST="${VLLM_OMNI_HOST:-0.0.0.0}"
+PORT="${VLLM_OMNI_PORT:-8091}"
 echo "Using deploy config: $DEPLOY_CONFIG"
 echo "Using launch profile: $PROFILE_LABEL"
 echo "Using worker multiprocessing method: $VLLM_WORKER_MULTIPROC_METHOD"
+echo "Binding vllm-omni to ${HOST}:${PORT}"
 
 GPU_MEMORY_ARGS=()
 if [ -n "${VLLM_GLOBAL_GPU_MEMORY_UTILIZATION:-}" ]; then
@@ -76,8 +79,8 @@ fi
 
 vllm-omni serve "$MODEL" \
     --deploy-config "$DEPLOY_CONFIG" \
-    --host 0.0.0.0 \
-    --port 8091 \
+    --host "$HOST" \
+    --port "$PORT" \
     "${GPU_MEMORY_ARGS[@]}" \
     --trust-remote-code \
     --omni

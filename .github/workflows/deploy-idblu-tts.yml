@@ -1,0 +1,163 @@
+name: Deploy ID-BLU TTS
+
+on:
+  push:
+    branches:
+      - idblu-tts-wrapper-docker
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  AWS_REGION: ca-central-1
+  AWS_ACCOUNT_ID: "449678530532"
+  ECR_REPOSITORY: idblu-tts
+  ASG_NAME: idblu-tts-auto-tts-asg-shared
+  HEALTH_URL: https://tts-auto.account.idblu.com/health
+  DOCKERFILE_PATH: docker/Dockerfile.idblu_tts
+
+jobs:
+  deploy:
+    name: Build, push & deploy idblu_tts
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.IDBLU_TTS_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          VERSION="0.1.0-${SHA}"
+          ECR_REG="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE="${ECR_REG}/${ECR_REPOSITORY}:${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "ecr_reg=${ECR_REG}" >> $GITHUB_OUTPUT
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE_PATH }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.tag.outputs.image }}
+            ${{ steps.tag.outputs.ecr_reg }}/${{ env.ECR_REPOSITORY }}:latest
+          build-args: |
+            FORK_COMMIT=${{ github.sha }}
+            WRAPPER_VERSION=${{ steps.tag.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update ASG launch template and trigger instance refresh
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          ECR_REG="${{ steps.tag.outputs.ecr_reg }}"
+
+          LT_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId" \
+            --output text)
+
+          if [ -z "$LT_ID" ] || [ "$LT_ID" = "None" ]; then
+            echo "Could not find launch template for ASG $ASG_NAME"
+            exit 1
+          fi
+
+          CURRENT_UD=$(aws ec2 describe-launch-template-versions \
+            --launch-template-id "$LT_ID" \
+            --versions '$Default' \
+            --query "LaunchTemplateVersions[0].LaunchTemplateData.UserData" \
+            --output text | base64 -d)
+
+          NEW_UD=$(echo "$CURRENT_UD" | \
+            sed "s|${ECR_REPOSITORY}:[^ \"']*|${ECR_REPOSITORY}:${VERSION}|g" | \
+            base64)
+
+          NEW_VER=$(aws ec2 create-launch-template-version \
+            --launch-template-id "$LT_ID" \
+            --source-version '$Default' \
+            --launch-template-data "{\"UserData\":\"${NEW_UD//$'\n'/}\"}" \
+            --query "LaunchTemplateVersion.VersionNumber" \
+            --output text)
+
+          aws ec2 modify-launch-template \
+            --launch-template-id "$LT_ID" \
+            --default-version "$NEW_VER"
+
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --launch-template "LaunchTemplateId=${LT_ID},Version=\$Default"
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":180}' \
+            --query "InstanceRefreshId" \
+            --output text)
+
+          ELAPSED=0
+          MAX_WAIT=3600
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            REFRESH_STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
+              --output text 2>/dev/null || echo "InProgress")
+
+            case "$REFRESH_STATUS" in
+              Successful)
+                echo "Instance refresh complete"
+                break
+                ;;
+              Failed|Cancelled|RollbackFailed)
+                echo "Instance refresh failed with status $REFRESH_STATUS"
+                exit 1
+                ;;
+            esac
+
+            sleep 15
+            ELAPSED=$((ELAPSED + 15))
+          done
+
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "Timed out waiting for instance refresh"
+            exit 1
+          fi
+
+      - name: Wait for idblu_tts health
+        run: |
+          for i in $(seq 1 18); do
+            CODE=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+            echo "[$i/18] HTTP $CODE"
+            [ "$CODE" = "200" ] && exit 0
+            sleep 20
+          done
+          exit 1

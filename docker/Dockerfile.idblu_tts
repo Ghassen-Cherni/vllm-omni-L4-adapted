@@ -1,0 +1,36 @@
+ARG BASE_IMAGE=vllm/vllm-openai:v0.19.0
+FROM ${BASE_IMAGE}
+
+ARG COMMON_WORKDIR=/app
+ARG FORK_COMMIT=d1321732e7665068e98cc1a6d2897c2764a1e6cd
+ARG WRAPPER_VERSION=1
+ARG PACKAGE_VERSION_OVERRIDE=0.1.0.dev0
+
+LABEL org.opencontainers.image.title="idblu_tts"
+LABEL org.opencontainers.image.description="ID-BLU wrapper around vllm-omni Qwen3 TTS"
+LABEL org.opencontainers.image.version="${WRAPPER_VERSION}"
+LABEL org.opencontainers.image.revision="${FORK_COMMIT}"
+
+ENV VLLM_OMNI_VERSION_OVERRIDE=${PACKAGE_VERSION_OVERRIDE}
+
+WORKDIR ${COMMON_WORKDIR}
+
+RUN apt-get update && \
+    apt-get install -y git jq && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni /data/voices
+
+COPY docker/use_venv_cuda.sh ${COMMON_WORKDIR}/use_venv_cuda.sh
+COPY . ${COMMON_WORKDIR}/vllm-omni
+
+RUN cd ${COMMON_WORKDIR}/vllm-omni && \
+    uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+
+RUN chmod +x ${COMMON_WORKDIR}/use_venv_cuda.sh ${COMMON_WORKDIR}/vllm-omni/docker/start-idblu-tts.sh && \
+    ln -sf /usr/bin/python3 /usr/bin/python
+
+EXPOSE 8080 8091
+
+ENTRYPOINT ["/app/vllm-omni/docker/start-idblu-tts.sh"]

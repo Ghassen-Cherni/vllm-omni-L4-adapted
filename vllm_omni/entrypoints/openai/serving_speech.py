@@ -1225,6 +1225,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
         """
+        resolve_started_at = time.monotonic()
+        if ref_audio_str.startswith("data:"):
+            source_kind = "data"
+        elif ref_audio_str.startswith("file://"):
+            source_kind = "file"
+        elif ref_audio_str.startswith("https://"):
+            source_kind = "https"
+        elif ref_audio_str.startswith("http://"):
+            source_kind = "http"
+        else:
+            source_kind = "unknown"
+
         # In diffusion mode, model_config may not be available
         if self._diffusion_mode:
             connector = MediaConnector()
@@ -1250,6 +1262,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"Reference audio too long ({duration:.1f}s). "
                 f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
             )
+        logger.info(
+            "Resolved ref_audio: source=%s elapsed=%.3fs sample_rate=%d duration=%.3fs samples=%d",
+            source_kind,
+            time.monotonic() - resolve_started_at,
+            sr,
+            duration,
+            len(wav_np),
+        )
         return wav_np.tolist(), sr
 
     async def _generate_audio_chunks(
@@ -1258,6 +1278,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str,
         response_format: str = "pcm",
         raw_request: Request | None = None,
+        trace_id: str | None = None,
+        request_started_at: float | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -1309,6 +1331,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+                    if first_chunk:
+                        prefix = f"[{trace_id}] " if trace_id else ""
+                        latency_suffix = ""
+                        if request_started_at is not None:
+                            latency_suffix = f" after {time.monotonic() - request_started_at:.3f}s"
+                        logger.info(
+                            "%sUpstream first generated audio chunk for %s%s",
+                            prefix,
+                            request_id,
+                            latency_suffix,
+                        )
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
                         # Assert that sample rate has been set from chunk metadata (not just default)
@@ -1667,9 +1700,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
         request_id: str | None = None,
+        trace_id: str | None = None,
     ) -> tuple[str, Any, dict[str, Any]]:
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+
+        prepare_started_at = time.monotonic()
 
         # If this is a streaming request, we need to coerce
         # cumulative outputs to delta outputs; this ensures
@@ -1683,16 +1719,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if validation_error:
                 raise ValueError(validation_error)
             ref_audio_data = None
+            ref_audio_resolve_elapsed = 0.0
             if request.ref_audio is not None:
+                ref_audio_resolve_started_at = time.monotonic()
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 ref_audio_data = (wav_list, sr)
+                ref_audio_resolve_elapsed = time.monotonic() - ref_audio_resolve_started_at
+            prompt_build_started_at = time.monotonic()
             prompt = await self._build_fish_speech_prompt_async(request, ref_audio_data=ref_audio_data)
+            prompt_build_elapsed = time.monotonic() - prompt_build_started_at
             tts_params = {}
         elif self._tts_model_type == "omnivoice":
             if not request.input or not request.input.strip():
                 raise ValueError("Input text cannot be empty")
             tts_params = {}
             prompt: dict[str, Any] = {"input": request.input}
+            ref_audio_resolve_elapsed = 0.0
             # Resolve ref_audio: explicit request param or uploaded voice
             ref_src = request.ref_audio
             if not ref_src and request.voice:
@@ -1708,7 +1750,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 fmt_err = self._validate_ref_audio_format(ref_src)
                 if fmt_err:
                     raise ValueError(fmt_err)
+                ref_audio_resolve_started_at = time.monotonic()
                 wav, sr = await self._resolve_ref_audio(ref_src)
+                ref_audio_resolve_elapsed = time.monotonic() - ref_audio_resolve_started_at
                 prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
             if request.ref_text:
                 prompt["ref_text"] = request.ref_text
@@ -1716,8 +1760,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["lang"] = request.language
             if request.instructions:
                 prompt["instruct"] = request.instructions
+            prompt_build_elapsed = 0.0
         elif self._tts_model_type == "voxcpm2":
+            prompt_build_started_at = time.monotonic()
             prompt = await self._build_voxcpm2_prompt(request)
+            prompt_build_elapsed = time.monotonic() - prompt_build_started_at
+            ref_audio_resolve_elapsed = 0.0
             tts_params = {}
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
@@ -1725,31 +1773,48 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError(validation_error)
 
             if self._tts_model_type == "voxtral_tts":
+                prompt_build_started_at = time.monotonic()
                 prompt = await self._build_voxtral_prompt_async(request)
+                prompt_build_elapsed = time.monotonic() - prompt_build_started_at
+                ref_audio_resolve_elapsed = 0.0
                 tts_params = {}
             elif self._tts_model_type == "cosyvoice3":
+                prompt_build_started_at = time.monotonic()
                 prompt = await self._build_cosyvoice3_prompt(request)
+                prompt_build_elapsed = time.monotonic() - prompt_build_started_at
+                ref_audio_resolve_elapsed = 0.0
                 tts_params = {}
             elif self._tts_model_type == "ming_flash_omni_tts":
+                prompt_build_started_at = time.monotonic()
                 prompt = self._build_ming_prompt(request)
+                prompt_build_elapsed = time.monotonic() - prompt_build_started_at
+                ref_audio_resolve_elapsed = 0.0
                 tts_params = {}
             elif self._tts_model_type == "moss_tts_nano":
+                prompt_build_started_at = time.monotonic()
                 tts_params = await self._build_moss_tts_params(request)
                 prompt = {"prompt_token_ids": [1], "additional_information": tts_params}
+                prompt_build_elapsed = time.monotonic() - prompt_build_started_at
+                ref_audio_resolve_elapsed = 0.0
             else:
+                prompt_build_started_at = time.monotonic()
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
                 # to [[wav_list, sr]] so the model doesn't re-decode base64.
                 ref_audio_source = request.ref_audio
+                ref_audio_resolve_elapsed = 0.0
                 if ref_audio_source is None and isinstance(tts_params.get("ref_audio"), list):
                     # Uploaded voice: ref_audio was auto-set as [base64_data_url]
                     ref_audio_source = tts_params["ref_audio"][0]
                 if ref_audio_source is not None and isinstance(ref_audio_source, str):
+                    ref_audio_resolve_started_at = time.monotonic()
                     wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
                     tts_params["ref_audio"] = [[wav_list, sr]]
+                    ref_audio_resolve_elapsed = time.monotonic() - ref_audio_resolve_started_at
 
                 ph_len = await self._estimate_prompt_len_async(tts_params)
                 prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
+                prompt_build_elapsed = time.monotonic() - prompt_build_started_at
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -1771,6 +1836,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             tts_params = {}
             prompt = {"prompt": request.input}
+            prompt_build_elapsed = 0.0
+            ref_audio_resolve_elapsed = 0.0
 
         request_id = request_id or f"speech-{random_uuid()}"
         if self._is_fish_speech:
@@ -1796,6 +1863,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request_id,
             request.input[:50] + "..." if len(request.input) > 50 else request.input,
             model_type,
+        )
+        prompt_token_count = len(prompt.get("prompt_token_ids", [])) if isinstance(prompt, dict) else 0
+        ref_audio_sample_count = 0
+        if isinstance(tts_params.get("ref_audio"), list) and tts_params["ref_audio"]:
+            first_ref_audio = tts_params["ref_audio"][0]
+            if isinstance(first_ref_audio, (list, tuple)) and len(first_ref_audio) == 2 and isinstance(first_ref_audio[0], list):
+                ref_audio_sample_count = len(first_ref_audio[0])
+        prefix = f"[{trace_id}] " if trace_id else ""
+        logger.info(
+            "%sPrepared speech generation %s in %.3fs: model_type=%s prompt_tokens=%d has_ref_audio=%s "
+            "ref_audio_resolve=%.3fs prompt_build=%.3fs ref_audio_samples=%d",
+            prefix,
+            request_id,
+            time.monotonic() - prepare_started_at,
+            model_type,
+            prompt_token_count,
+            bool(tts_params.get("ref_audio") or request.ref_audio),
+            ref_audio_resolve_elapsed,
+            prompt_build_elapsed,
+            ref_audio_sample_count,
         )
 
         # CosyVoice3: set dynamic min/max tokens based on text length.
@@ -2061,10 +2148,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return error_check_ret
 
         request_id = f"speech-{random_uuid()}"
+        trace_id = raw_request.headers.get("X-TTS-Trace-Id") if raw_request else None
+        request_started_at = time.monotonic()
         if raw_request:
             raw_request.state.request_metadata = RequestResponseMetadata(
                 request_id=request_id,
             )
+        logger.info(
+            "%sReceived speech request %s: model=%s voice=%s task_type=%s language=%s "
+            "stream=%s response_format=%s max_new_tokens=%s initial_codec_chunk_frames=%s text_len=%d",
+            f"[{trace_id}] " if trace_id else "",
+            request_id,
+            request.model,
+            request.voice,
+            request.task_type,
+            request.language or "Auto",
+            request.stream,
+            request.response_format,
+            request.max_new_tokens,
+            request.initial_codec_chunk_frames,
+            len(request.input or ""),
+        )
 
         try:
             if request.stream:
@@ -2086,13 +2190,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
-                _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                _, generator, _ = await self._prepare_speech_generation(
+                    request,
+                    request_id=request_id,
+                    trace_id=trace_id,
+                )
                 return StreamingResponse(
                     self._generate_audio_chunks(
                         generator,
                         request_id,
                         response_format,
                         raw_request=raw_request,
+                        trace_id=trace_id,
+                        request_started_at=request_started_at,
                     ),
                     media_type=media_type,
                 )

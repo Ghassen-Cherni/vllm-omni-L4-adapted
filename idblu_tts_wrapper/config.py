@@ -4,6 +4,11 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+DEFAULT_TTS_INSTRUCTIONS = (
+    "Parlez d'un ton naturel, chaleureux et expressif, avec une émotion humaine subtile. "
+    "Adaptez légèrement l'intonation au sens de la phrase, sans exagérer ni devenir théâtral."
+)
+
 
 def _truthy(value: str | None, *, default: bool) -> bool:
     if value is None:
@@ -19,6 +24,8 @@ class Settings:
     default_task_type: str
     default_response_format: str
     default_voice_id: str
+    default_instructions: str
+    default_instructions_enabled: bool
     voice_cache_dir: str
     health_public: bool
 
@@ -34,8 +41,6 @@ class Settings:
             raise ValueError("IDBLU_TTS_ADMIN_KEY is required")
         if not default_model:
             raise ValueError("IDBLU_TTS_MODEL_ID is required")
-        if not default_voice_id:
-            raise ValueError("IDBLU_TTS_DEFAULT_VOICE_ID is required")
         if not voice_cache_dir:
             raise ValueError("IDBLU_TTS_VOICE_CACHE_DIR is required")
 
@@ -50,6 +55,11 @@ class Settings:
             default_task_type=os.getenv("IDBLU_TTS_TASK_TYPE", "Base"),
             default_response_format=os.getenv("IDBLU_TTS_RESPONSE_FORMAT", "pcm"),
             default_voice_id=default_voice_id,
+            default_instructions=os.getenv("IDBLU_TTS_DEFAULT_INSTRUCTIONS", DEFAULT_TTS_INSTRUCTIONS).strip(),
+            default_instructions_enabled=_truthy(
+                os.getenv("IDBLU_TTS_DEFAULT_INSTRUCTIONS_ENABLED"),
+                default=True,
+            ),
             voice_cache_dir=voice_cache_dir,
             health_public=_truthy(os.getenv("IDBLU_TTS_PUBLIC_HEALTH"), default=True),
         )

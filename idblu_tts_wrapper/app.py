@@ -13,7 +13,7 @@ from typing import Any, AsyncGenerator
 
 import httpx
 import psutil
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from httpx import HTTPError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -187,13 +187,27 @@ async def healthcheck() -> JSONResponse:
 
 
 @app.get("/ready")
-async def readiness() -> JSONResponse:
-    voice_error = voice_registry.readiness_error(settings.default_voice_id)
-    if voice_error:
+async def readiness(voice_id: str | None = Query(default=None)) -> JSONResponse:
+    cache_error = voice_registry.cache_error()
+    if cache_error:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "not_ready", "reason": voice_error},
+            content={"status": "not_ready", "component": "voice_cache", "reason": cache_error},
         )
+
+    requested_voice_id = (voice_id or "").strip()
+    if requested_voice_id:
+        voice_error = voice_registry.readiness_error(requested_voice_id)
+        if voice_error:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={
+                    "status": "not_ready",
+                    "component": "voice_cache",
+                    "voice_id": requested_voice_id,
+                    "reason": voice_error,
+                },
+            )
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -211,9 +225,17 @@ async def readiness() -> JSONResponse:
         logger.warning("Upstream readiness check failed: %s", exc)
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "not_ready", "reason": f"Upstream health check failed: {exc}"},
+            content={
+                "status": "not_ready",
+                "component": "upstream",
+                "voice_id": requested_voice_id or None,
+                "reason": f"Upstream health check failed: {exc}",
+            },
         )
-    return JSONResponse(content={"status": "ready", "upstream": payload})
+    content: dict[str, Any] = {"status": "ready", "upstream": payload}
+    if requested_voice_id:
+        content["voice_id"] = requested_voice_id
+    return JSONResponse(content=content)
 
 
 @app.get("/metrics/runtime", dependencies=[Depends(_authorize)])
@@ -235,9 +257,21 @@ async def create_speech(request: SpeechRequest, raw_request: Request) -> Streami
     payload["task_type"] = payload.get("task_type") or settings.default_task_type
     payload["response_format"] = payload.get("response_format") or settings.default_response_format
     payload["stream"] = True if payload.get("stream") is None else payload["stream"]
+    if (
+        settings.default_instructions_enabled
+        and settings.default_instructions
+        and not str(payload.get("instructions") or "").strip()
+    ):
+        payload["instructions"] = settings.default_instructions
 
     resolved_locally = False
-    requested_voice_id = payload.pop("voice_id", None) or payload.get("voice") or settings.default_voice_id
+    requested_voice_id = payload.pop("voice_id", None) or payload.get("voice")
+
+    if payload.get("ref_audio") is None and not requested_voice_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="voice_id is required when ref_audio is not provided",
+        )
 
     try:
         if payload.get("ref_audio") is None and requested_voice_id:

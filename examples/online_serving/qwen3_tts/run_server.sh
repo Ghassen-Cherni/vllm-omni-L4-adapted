@@ -51,7 +51,7 @@ case "$PROFILE" in
         PROFILE_LABEL="latency"
         ;;
     default|fast)
-        DEPLOY_CONFIG="vllm_omni/deploy/qwen3_tts.yaml"
+        DEPLOY_CONFIG="${QWEN3_TTS_DEPLOY_CONFIG:-vllm_omni/deploy/qwen3_tts.yaml}"
         PROFILE_LABEL="default"
         ;;
     *)

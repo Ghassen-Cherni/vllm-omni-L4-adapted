@@ -106,12 +106,13 @@ class VoiceRegistry:
         )
 
     def readiness_error(self, voice_id: str) -> str | None:
-        if not self._cache_dir.exists() or not self._cache_dir.is_dir():
-            return f"Voice cache directory is unavailable: {self._cache_dir}"
+        cache_error = self.cache_error()
+        if cache_error:
+            return cache_error
 
         normalized = voice_id.strip()
         if not normalized:
-            return "Default voice id is empty"
+            return None
 
         metadata_dir = self._cache_dir / normalized
         metadata_path = metadata_dir / "metadata.json"
@@ -139,6 +140,11 @@ class VoiceRegistry:
                 f"migrate it to {self._cache_dir / normalized / 'metadata.json'}"
             )
         return f"Voice '{normalized}' not found in {self._cache_dir}"
+
+    def cache_error(self) -> str | None:
+        if not self._cache_dir.exists() or not self._cache_dir.is_dir():
+            return f"Voice cache directory is unavailable: {self._cache_dir}"
+        return None
 
     @staticmethod
     def _load_json(path: Path) -> dict:
